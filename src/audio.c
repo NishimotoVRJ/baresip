@@ -708,6 +708,8 @@ int audio_alloc(struct audio **ap, const struct config *cfg,
 	if (err)
 		goto out;
 
+	sdp_media_set_ldir(a->strm->sdp, cfg->call.dir);
+
 	if (cfg->avt.rtp_bw.max) {
 		stream_set_bw(a->strm, AUDIO_BANDWIDTH);
 	}

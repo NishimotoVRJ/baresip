@@ -33,7 +33,8 @@ static struct config core_config = {
 	/** Call config */
 	{
 		120,
-		4
+		4,
+		3
 	},
 
 	/** Audio */
@@ -164,6 +165,8 @@ int config_parse_conf(struct config *cfg, const struct conf *conf)
 			   &cfg->call.local_timeout);
 	(void)conf_get_u32(conf, "call_max_calls",
 			   &cfg->call.max_calls);
+	(void)conf_get_u32(conf, "call_dir",
+			   &cfg->call.dir);
 
 	/* Audio */
 	(void)conf_get_str(conf, "audio_path", cfg->audio.audio_path,
@@ -265,6 +268,7 @@ int config_print(struct re_printf *pf, const struct config *cfg)
 			 "# Call\n"
 			 "call_local_timeout\t%u\n"
 			 "call_max_calls\t%u\n"
+			 "call_dir\t%u\n"
 			 "\n"
 			 "# Audio\n"
 			 "audio_path\t\t%s\n"
@@ -311,6 +315,7 @@ int config_print(struct re_printf *pf, const struct config *cfg)
 
 			 cfg->call.local_timeout,
 			 cfg->call.max_calls,
+			 cfg->call.dir,
 
 			 cfg->audio.audio_path,
 			 cfg->audio.play_mod,  cfg->audio.play_dev,
@@ -431,6 +436,7 @@ static int core_config_template(struct re_printf *pf, const struct config *cfg)
 			  "# Call\n"
 			  "call_local_timeout\t%u\n"
 			  "call_max_calls\t%u\n"
+			  "#call_dir\t2 # set 2 for sendonly\n"
 			  "\n"
 			  "# Audio\n"
 			  "#audio_path\t\t/usr/share/baresip\n"
