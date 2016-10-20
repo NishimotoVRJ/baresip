@@ -429,7 +429,7 @@ int stream_send(struct stream *s, bool marker, int pt, uint32_t ts,
 
 	if (!sa_isset(sdp_media_raddr(s->sdp), SA_ALL))
 		return 0;
-	if (sdp_media_dir(s->sdp) != SDP_SENDRECV)
+	if (call_is_onhold(s->call))
 		return 0;
 
 	metric_add_packet(&s->metric_tx, mbuf_get_left(mb));

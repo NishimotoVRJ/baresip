@@ -163,6 +163,7 @@ struct config_sip {
 struct config_call {
 	uint32_t local_timeout; /**< Incoming call timeout [sec] 0=off */
 	uint32_t max_calls;     /**< Maximum number of calls, 0=unlimited */
+	uint32_t dir;
 };
 
 /** Audio */

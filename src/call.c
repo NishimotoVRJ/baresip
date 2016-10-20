@@ -81,6 +81,7 @@ struct call {
 
 	uint32_t rtp_timeout_ms;  /**< RTP Timeout in [ms]                  */
 	uint32_t linenum;         /**< Line number from 1 to N              */
+	uint32_t dir;
 };
 
 
@@ -534,6 +535,7 @@ int call_alloc(struct call **callp, const struct config *cfg, struct list *lst,
 	call->eh     = eh;
 	call->arg    = arg;
 	call->af     = prm ? prm->af : AF_INET;
+	call->dir    = cfg->call.dir;
 
 	err = str_dup(&call->local_uri, local_uri);
 	if (local_name)
@@ -880,6 +882,9 @@ int call_hold(struct call *call, bool hold)
 	info("call: %s %s\n", hold ? "hold" : "resume", call->peer_uri);
 
 	call->on_hold = hold;
+
+	if(call->dir == SDP_SENDONLY)
+		return 0;
 
 	FOREACH_STREAM
 		stream_hold(le->data, hold);

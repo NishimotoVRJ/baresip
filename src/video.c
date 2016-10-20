@@ -787,6 +787,8 @@ int video_alloc(struct video **vp, const struct config *cfg,
 	if (err)
 		goto out;
 
+	sdp_media_set_ldir(v->strm->sdp, cfg->call.dir);
+
 	if (cfg->avt.rtp_bw.max >= AUDIO_BANDWIDTH) {
 		stream_set_bw(v->strm, cfg->avt.rtp_bw.max - AUDIO_BANDWIDTH);
 	}
