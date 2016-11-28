@@ -91,9 +91,9 @@ static void print_stats(struct audio_loop *al)
 		rw_ratio = 1.0 * al->n_read / al->n_write;
 
 	(void)re_fprintf(stderr, "\r%uHz %dch "
-			 " n_read=%u n_write=%u rw_ratio=%.2f",
+			 " n_read=%u n_write=%u rw_ratio=%.2f buf=%u",
 			 al->srate, al->ch,
-			 al->n_read, al->n_write, rw_ratio);
+			 al->n_read, al->n_write, rw_ratio, aubuf_cur_size(al->ab));
 
 	if (str_isset(aucodec))
 		(void)re_fprintf(stderr, " codec='%s'", aucodec);
@@ -229,9 +229,13 @@ static int auloop_reset(struct audio_loop *al)
 	al->sampv  = mem_deref(al->sampv);
 	al->ab     = mem_deref(al->ab);
 
-	al->srate = configv[al->index].srate;
-	al->ch    = configv[al->index].ch;
+	al->srate = cfg->audio.srate_src;
+	al->ch    = cfg->audio.channels_src;
 
+	if (str_isset(aucodec) || !al->srate || !al->ch) {
+		al->srate = configv[al->index].srate;
+		al->ch    = configv[al->index].ch;
+	}
 	if (str_isset(aucodec)) {
 		al->sampc = al->srate * al->ch * PTIME / 1000;
 		al->sampv = mem_alloc(al->sampc * 2, NULL);
