@@ -15,7 +15,8 @@
 #include <libavformat/avformat.h>
 #include <libavdevice/avdevice.h>
 #include <libavcodec/avcodec.h>
-
+#include "queue.h"
+#include "audio.h"
 
 /**
  * @defgroup avformat avformat
@@ -49,12 +50,38 @@
 #define AV_PIX_FMT_YUV420P PIX_FMT_YUV420P
 #endif
 
+struct threadq_st {
+    PacketQueue q;
+    bool thread_run;
+    pthread_t thread;
+};
+
+static void threadq_destroy(struct threadq_st* st) {
+	packet_queue_abort(&st->q);
+	if (st->thread_run) {
+		st->thread_run = false;
+		pthread_join(st->thread, NULL);
+	}
+	packet_queue_end(&st->q);
+}
+
+static int threadq_init(struct threadq_st* st,  void *(*start_routine) (void *), void* arg) {
+	packet_queue_init(&st->q);
+	st->thread_run = true;
+	int err = pthread_create(&st->thread, NULL, start_routine, arg);
+	if (err) {
+		st->thread_run = false;
+	}
+	return err;
+}
+
+// video send does not really needed for now (at least on mp4 file on core i7)
+// TODO: video out of sync during loop, frameq should be buffered somewhere
+#define USE_VIDEO_SEND_THREAD 0
 
 struct vidsrc_st {
 	const struct vidsrc *vs;  /* inheritance */
-	pthread_t thread;
-	bool run;
-	AVFormatContext *ic;
+	struct common_st* common;
 	AVCodec *codec;
 	AVCodecContext *ctx;
 	struct vidsz sz;
@@ -62,35 +89,56 @@ struct vidsrc_st {
 	void *arg;
 	int sindex;
 	int fps;
+    struct vidframe* vid_dest;
+	struct threadq_st video_decode;
+#if USE_VIDEO_SEND_THREAD
+	struct threadq_st video_send;
+#endif
 };
 
 
 static struct vidsrc *mod_avf;
 
+static struct ausrc *ausrc;
+extern struct common_st *common;
+extern AVPacket flush_pkt;
 
 static void destructor(void *arg)
 {
 	struct vidsrc_st *st = arg;
+    
+    if(st->common->run) {
+        st->common->run = false;
+        pthread_join(st->common->thread, NULL);
+    }
 
-	if (st->run) {
-		st->run = false;
-		pthread_join(st->thread, NULL);
-	}
+#if USE_VIDEO_SEND_THREAD
+	threadq_destroy(&st->video_send);
+#endif
+
+	threadq_destroy(&st->video_decode);
+
+	st->common->vs = NULL;
+	st->common = NULL;
+	//common = mem_deref(st->common);
+
+	if(st->vid_dest)
+		mem_deref(st->vid_dest);
 
 	if (st->ctx && st->ctx->codec)
 		avcodec_close(st->ctx);
-
-	if (st->ic) {
-#if LIBAVFORMAT_VERSION_INT >= ((53<<16) + (21<<8) + 0)
-		avformat_close_input(&st->ic);
-#else
-		av_close_input_file(st->ic);
-#endif
-	}
+    
+    mem_deref(common);
 }
 
+#if USE_VIDEO_SEND_THREAD
+static void av_destruct_vidframe_packet(AVPacket *pkt) {
+	mem_deref(pkt->data);
+    pkt->data = NULL;
+}
+#endif
 
-static void handle_packet(struct vidsrc_st *st, AVPacket *pkt)
+static void handle_packet(struct vidsrc_st *st, AVPacket *pkt, bool* skip)
 {
 	AVFrame *frame = NULL;
 	struct vidframe vf;
@@ -143,14 +191,67 @@ static void handle_packet(struct vidsrc_st *st, AVPacket *pkt)
 		return;
 	}
 
-	vf.size = sz;
-	vf.fmt  = VID_FMT_YUV420P;
-	for (i=0; i<4; i++) {
-		vf.data[i]     = frame->data[i];
-		vf.linesize[i] = frame->linesize[i];
+	if(!*skip) {
+		vf.size = sz;
+		vf.fmt  = VID_FMT_YUV420P;
+		for (i=0; i<4; i++) {
+			vf.data[i]     = frame->data[i];
+			vf.linesize[i] = frame->linesize[i];
+		}
+
+		if(st->vid_dest)
+			vidconv(st->vid_dest, &vf, NULL);
+	}
+	struct vidframe* vid_dest = st->vid_dest ? st->vid_dest : &vf;
+
+#if USE_VIDEO_SEND_THREAD
+
+	struct vidframe* frameq;
+	if(vidframe_alloc(&frameq, vid_dest->fmt, &vid_dest->size))
+		goto out;
+
+	vidframe_copy(frameq, vid_dest);
+	AVPacket pktq = *pkt;
+	pktq.data = frameq;
+	pktq.size = 0;
+	pktq.destruct = av_destruct_vidframe_packet;
+	packet_queue_put(&st->video_send.q, &pktq);
+#else
+	if(!st->common->time_start)
+		st->common->time_start = tmr_jiffies();
+
+	const bool auloop = false;
+	const double frame_dt = av_q2d(st->ctx->time_base);
+	const uint64_t packet_time = 1000 * frame->pkt_pts * av_q2d(st->common->ic->streams[pkt->stream_index]->time_base) + (auloop ? 1200 : 0);
+	const uint64_t elapsed = (!auloop && st->common->as && st->common->as->audio_time) ? st->common->as->audio_time : tmr_jiffies() - st->common->time_start;
+
+	/*if (!auloop && st->common->as && st->common->as->audio_time) {
+		if(abs(st->common->as->audio_time - elapsed) > 500 && aubuf_cur_size(st->common->as->aubuf) > st->common->as->psize) {
+			elapsed = st->common->as->audio_time;
+			st->common->time_start = tmr_jiffies() - elapsed;
+		}
+	}*/
+
+	int64_t dt = elapsed - packet_time;
+	//debug("video elapsed: %d, packet_time: %d, dt: %d, picnum: %d\n", elapsed, packet_time, dt, frame->coded_picture_number);
+	//debug("audio elapsed: %d, audio: %d, video: %d\n", st->common->as ? st->common->as->audio_time : 0, st->common->as ? aubuf_cur_size(st->common->as->aubuf): 0, st->video_decode.q.nb_packets);
+
+	if(abs(dt)<=frame_dt || dt <= 0) {
+		dt = -dt;
+		const uint32_t sec  = dt/1000;
+		const uint32_t nano = (dt - sec * 1000) * 1000000;
+		const struct timespec delay = {sec, nano};
+		(void)nanosleep(&delay, NULL);
+
+		if(!*skip)
+			st->frameh(vid_dest, st->arg);
+		*skip = false;
+	} else {
+		debug("video is late by: %d ms, videoq: %d\n", dt, st->video_decode.q.nb_packets);
+		//*skip = true;
 	}
 
-	st->frameh(&vf, st->arg);
+#endif
 
  out:
 	if (frame) {
@@ -162,39 +263,173 @@ static void handle_packet(struct vidsrc_st *st, AVPacket *pkt)
 	}
 }
 
-
-static void *read_thread(void *data)
-{
+#if USE_VIDEO_SEND_THREAD
+static void *video_send_thread(void *data){
 	struct vidsrc_st *st = data;
+	AVPacket pkt;
+	bool skip = false;
 
-	while (st->run) {
-		AVPacket pkt;
-		int ret;
+	while (st->video_send.thread_run) {
+        if (st->video_send.q.abort_request)
+        	break;
 
-		av_init_packet(&pkt);
+        if (packet_queue_get(&st->video_send.q, &pkt, 0) <= 0) {
+        	continue;
+        }
 
-		ret = av_read_frame(st->ic, &pkt);
-		if (ret < 0) {
-			debug("avformat: rewind stream (ret=%d)\n", ret);
-			sys_msleep(1000);
-			av_seek_frame(st->ic, -1, 0, 0);
-			continue;
-		}
+        if (pkt.data == flush_pkt.data) {
+            //avcodec_flush_buffers(st->ctx);
+            continue;
+        }
 
-		if (pkt.stream_index != st->sindex)
-			goto out;
+		if(!st->common->time_start)
+			st->common->time_start = tmr_jiffies();
 
-		handle_packet(st, &pkt);
+		if (!skip) {
+			st->frameh(pkt.data, st->arg);
 
-		/* simulate framerate */
-		sys_msleep(1000/st->fps);
+			const uint64_t packet_time = 1000 * pkt.pts * av_q2d(st->common->ic->streams[pkt.stream_index]->time_base);
+			const uint64_t elapsed = tmr_jiffies() - st->common->time_start;
+			const int64_t dt = elapsed - packet_time;
+			//debug("video elapsed: %d, packet_time: %d, dt: %d\n", elapsed, packet_time, dt);
 
-	out:
+			if(dt<=0) {
+				const struct timespec delay = {0, -dt*1000000/3};
+				(void)nanosleep(&delay, NULL);
+			} else {
+				debug("video is late by: %d ms, videoq: %d\n", dt, st->video_send.q.nb_packets);
+				skip = true;
+			}
+		} else
+			skip = false;
+
 #if LIBAVCODEC_VERSION_INT >= ((57<<16)+(12<<8)+100)
 		av_packet_unref(&pkt);
 #else
 		av_free_packet(&pkt);
 #endif
+	}
+
+	return NULL;
+}
+#endif
+
+static void *video_decode_thread(void *data) {
+	struct vidsrc_st *st = data;
+	AVPacket pkt;
+	bool skip = false;
+
+	while (st->video_decode.thread_run) {
+#if USE_VIDEO_SEND_THREAD
+		while (!st->video_decode.q.abort_request &&
+				st->video_send.q.nb_packets > 10) {
+			//debug("video_sendq: %d\n", st->video_send.q.nb_packets);
+			sys_msleep(10);
+		}
+#endif
+
+        if (st->video_decode.q.abort_request)
+        	break;
+
+        if (packet_queue_get(&st->video_decode.q, &pkt, 1) <= 0)
+        	continue;
+
+        while(st->common->as && !st->common->as->audio_time) {
+			const struct timespec delay = {0, st->common->as->prm.ptime*1000000/2};
+			(void)nanosleep(&delay, NULL);
+        }
+
+        if (pkt.data == flush_pkt.data) {
+            avcodec_flush_buffers(st->ctx);
+            continue;
+        }
+
+        handle_packet(st, &pkt, &skip);
+
+#if LIBAVCODEC_VERSION_INT >= ((57<<16)+(12<<8)+100)
+		av_packet_unref(&pkt);
+#else
+		av_free_packet(&pkt);
+#endif
+	}
+	return NULL;
+}
+
+void *avformat_read_thread(void *data)
+{
+	struct common_st *st = data;
+
+	while (st->run) {
+		AVPacket pkt;
+		int ret;
+		while ( st->run &&
+				((st->as && aubuf_cur_size(st->as->aubuf) > st->as->prm.srate * st->as->prm.ch * 2) || !st->as) &&
+				((st->vs && st->vs->video_decode.q.nb_packets > 10) || !st->vs)) {
+			//if(st->as)
+			//	debug("audioBufSize: %d\n", aubuf_cur_size(st->as->aubuf));
+			//if(st->vs)
+			//	debug("video_decodeq: %d\n", st->vs->video_decode.q.nb_packets);
+			sys_msleep(10);
+		}
+
+		av_init_packet(&pkt);
+
+		ret = av_read_frame(st->ic, &pkt);
+		//const uint64_t packet_time = 1000 * pkt.pts * av_q2d(st->ic->streams[pkt.stream_index]->time_base);
+
+		if (ret < 0) {
+			debug("avformat: rewind stream (ret=%d)\n", ret);
+            audio_flush_buffer(st->as);            
+			while (st->as && aubuf_cur_size(st->as->aubuf) &&
+					st->vs && st->vs->video_decode.q.nb_packets) {
+				sys_msleep(100);
+			}
+
+			if(st->as) {
+				packet_queue_flush(&st->as->audioq);
+				packet_queue_put(&st->as->audioq, &flush_pkt);
+			}
+			if(st->vs) {
+				packet_queue_flush(&st->vs->video_decode.q);
+				packet_queue_put(&st->vs->video_decode.q, &flush_pkt);
+#if USE_VIDEO_SEND_THREAD
+				packet_queue_flush(&st->vs->video_send.q);
+#endif
+			}
+
+			av_seek_frame(st->ic, -1, 0, 0);
+			if(st->as){
+				st->as->audio_time = 0;
+				st->as->first_packet_time = 0;
+			}
+
+            //wait for the flush packet to be consumed by video thread
+            while(st->vs && st->vs->video_decode.q.nb_packets){
+                sys_msleep(5);
+            }
+			st->time_start = 0;
+			continue;
+		}
+
+		//debug("packet sindex: %d, elaps:%d\n", pkt.stream_index, elapsed);
+		//debug("packet sindex: %d, time: %f\n", pkt.stream_index, 1000 * pkt.pts * av_q2d(st->ic->streams[pkt.stream_index]->time_base));
+        //debug("queue size: %d\n\n", st->as->audioq.size);
+
+		if (st->vs && pkt.stream_index == st->vs->sindex) {
+            packet_queue_put(&st->vs->video_decode.q, &pkt);
+		}
+
+		if (st->as && pkt.stream_index == st->as->sindex) {
+			// this audio queue is directly consumed by audio_decode_frame
+			// keep it this way until we need to move audio decoder to separate thread
+            packet_queue_put(&st->as->audioq, &pkt);
+            {
+            	AVPacket audio_pkt, pkt_temp;
+            	memset(&audio_pkt, 0, sizeof(audio_pkt));
+                memset(&pkt_temp, 0, sizeof(pkt_temp));
+            	audio_decode_frame(st->as, &audio_pkt, &pkt_temp);
+            }
+		}
 	}
 
 	return NULL;
@@ -225,8 +460,18 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	if (!st)
 		return ENOMEM;
 
+    if (!common) {
+		common = mem_zalloc(sizeof(*common), destructor_common);
+        if (!common)
+            return ENOMEM;
+    } else {
+        mem_ref(common);
+    }
+
+	st->common = common;
 	st->vs     = vs;
 	st->sz     = *size;
+	st->vid_dest = NULL;
 	st->frameh = frameh;
 	st->arg    = arg;
 
@@ -241,10 +486,10 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	 * avformat_open_input() was added in lavf 53.2.0 according to
 	 * ffmpeg/doc/APIchanges
 	 */
-
+	if(!st->common->ic) {
 #if LIBAVFORMAT_VERSION_INT >= ((52<<16) + (110<<8) + 0)
 	(void)fmt;
-	ret = avformat_open_input(&st->ic, dev, NULL, NULL);
+	ret = avformat_open_input(&st->common->ic, dev, NULL, NULL);
 #else
 
 	/* Params */
@@ -257,7 +502,7 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	prms.pix_fmt            = AV_PIX_FMT_YUV420P;
 	prms.channel            = 0;
 
-	ret = av_open_input_file(&st->ic, dev, av_find_input_format(fmt),
+	ret = av_open_input_file(&st->common->ic, dev, av_find_input_format(fmt),
 				 0, &prms);
 #endif
 
@@ -267,9 +512,9 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	}
 
 #if LIBAVFORMAT_VERSION_INT >= ((53<<16) + (4<<8) + 0)
-	ret = avformat_find_stream_info(st->ic, NULL);
+	ret = avformat_find_stream_info(st->common->ic, NULL);
 #else
-	ret = av_find_stream_info(st->ic);
+	ret = av_find_stream_info(st->common->ic);
 #endif
 
 	if (ret < 0) {
@@ -279,11 +524,12 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	}
 
 #if 0
-	dump_format(st->ic, 0, dev, 0);
+	dump_format(st->common->ic, 0, dev, 0);
 #endif
+	} // if(!st->common->ic)
 
-	for (i=0; i<st->ic->nb_streams; i++) {
-		const struct AVStream *strm = st->ic->streams[i];
+	for (i=0; i<st->common->ic->nb_streams; i++) {
+		const struct AVStream *strm = st->common->ic->streams[i];
 		AVCodecContext *ctx;
 
 #if LIBAVFORMAT_VERSION_INT >= ((57<<16) + (33<<8) + 100)
@@ -318,6 +564,14 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 		st->ctx    = ctx;
 		st->sindex = strm->index;
 
+		if(!vidsz_cmp(&st->sz, size)) {
+			ret = vidframe_alloc(&st->vid_dest, VID_FMT_YUV420P, size);
+			if (ret) {
+				err = ENOMEM;
+				goto out;
+			}
+		}
+
 		if (ctx->codec_id != AV_CODEC_ID_NONE) {
 
 			st->codec = avcodec_find_decoder(ctx->codec_id);
@@ -346,11 +600,22 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 		goto out;
 	}
 
-	st->run = true;
-	err = pthread_create(&st->thread, NULL, read_thread, st);
-	if (err) {
-		st->run = false;
-		goto out;
+	err = threadq_init(&st->video_decode, video_decode_thread, st);
+	if (err) goto out;
+
+#if USE_VIDEO_SEND_THREAD
+	err = threadq_init(&st->video_send, video_send_thread, st);
+	if (err) goto out;
+#endif
+
+	common->vs = st;
+	if(!st->common->thread) {
+		st->common->run = true;
+		err = pthread_create(&st->common->thread, NULL, avformat_read_thread, common);
+		if (err) {
+			st->common->run = false;
+			goto out;
+		}
 	}
 
  out:
@@ -362,9 +627,23 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	return err;
 }
 
+static int file_change_handler(struct re_printf *pf, void *arg)
+{
+    const struct cmd_arg *carg = arg;
+    (void)re_hprintf(pf, "file_change_handler %s\n", carg->prm);
+    struct config* cfg = conf_config();
+    strncpy(cfg->video.src_dev, carg->prm, sizeof(cfg->video.src_dev));
+    strncpy(cfg->audio.src_dev, carg->prm, sizeof(cfg->audio.src_dev));
+    return 0;
+}
+
+static const struct cmd cmdv[] = {
+    {"avformat-file", 0, CMD_PRM, "AVFormat file input", file_change_handler},
+};
 
 static int module_init(void)
 {
+	common = NULL;
 	/* register all codecs, demux and protocols */
 	avcodec_register_all();
 	avdevice_register_all();
@@ -374,18 +653,35 @@ static int module_init(void)
 #endif
 
 	av_register_all();
+	int err;
+	err = vidsrc_register(&mod_avf, "avformat", alloc, NULL);
+	if (err)
+		goto out;
 
-	return vidsrc_register(&mod_avf, "avformat", alloc, NULL);
+	err = ausrc_register(&ausrc, "avformat", alloc_audio);
+	if (err)
+		goto out;
+    
+    err = cmd_register(baresip_commands(), cmdv, ARRAY_SIZE(cmdv));
+    if (err)
+        goto out;
+
+out:
+	return err;
 }
 
 
 static int module_close(void)
 {
+	common = mem_deref(common);
 	mod_avf = mem_deref(mod_avf);
+	ausrc = mem_deref(ausrc);
 
 #if LIBAVFORMAT_VERSION_INT >= ((53<<16) + (13<<8) + 0)
 	avformat_network_deinit();
 #endif
+
+    cmd_unregister(baresip_commands(), cmdv);
 
 	return 0;
 }
@@ -393,7 +689,7 @@ static int module_close(void)
 
 EXPORT_SYM const struct mod_export DECL_EXPORTS(avformat) = {
 	"avformat",
-	"vidsrc",
+	"avsrc",
 	module_init,
 	module_close
 };
