@@ -193,6 +193,7 @@ static int open_encoder(struct videnc_state *st,
 #if LIBAVCODEC_VERSION_INT >= ((53<<16)+(8<<8)+0)
 	AVDictionary* opts = NULL;
 	av_dict_set(&opts, "preset", "ultrafast", 0);
+	av_dict_set(&opts, "tune", "zerolatency", 0);
 	if (avcodec_open2(st->ctx, st->codec, &opts) < 0) {
 		err = ENOENT;
 		goto out;
