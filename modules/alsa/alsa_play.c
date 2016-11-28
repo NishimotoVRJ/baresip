@@ -59,7 +59,7 @@ static void *write_thread(void *arg)
 	int n;
 	int num_frames;
 
-	num_frames = st->prm.srate * st->prm.ptime / 1000;
+	num_frames = st->prm.srate * st->prm.ptime / 100;
 
 	while (st->run) {
 		const int samples = num_frames;
@@ -129,8 +129,8 @@ int alsa_play_alloc(struct auplay_st **stp, const struct auplay *ap,
 	st->arg = arg;
 	st->aufmt = alsa_sample_format;
 
-	st->sampc = prm->srate * prm->ch * prm->ptime / 1000;
-	num_frames = st->prm.srate * st->prm.ptime / 1000;
+	st->sampc = prm->srate * prm->ch * prm->ptime / 100;
+	num_frames = st->prm.srate * st->prm.ptime / 100;
 
 	st->sampv = mem_alloc(2 * st->sampc, NULL);
 	if (!st->sampv) {
