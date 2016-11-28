@@ -5,8 +5,8 @@
 #
 
 MOD		:= avformat
-$(MOD)_SRCS	+= avformat.c
-$(MOD)_LFLAGS	+= -lavdevice -lavformat -lavcodec -lavutil
+$(MOD)_SRCS	+= avformat.c audio.c queue.c
+$(MOD)_LFLAGS	+= -lavdevice -lavformat -lavcodec -lavutil -lavresample
 CFLAGS          += -DUSE_AVFORMAT
 
 include mk/mod.mk
