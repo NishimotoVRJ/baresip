@@ -56,6 +56,7 @@ struct vidsrc_st {
 	pthread_t thread;
 	bool run;
 	struct vidsz sz;
+	int fps;
 	u_int32_t pixfmt;
 	struct buffer *buffers;
 	unsigned int   n_buffers;
@@ -270,6 +271,15 @@ static int v4l2_init_device(struct vidsrc_st *st, const char *dev_name,
 		return ENODEV;
 	}
 
+	struct v4l2_streamparm parm;
+	parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	parm.parm.capture.timeperframe.numerator = 1;
+	parm.parm.capture.timeperframe.denominator = st->fps;
+
+	if (-1 == xioctl(st->fd, VIDIOC_S_PARM, &parm)) {
+		warning("v4l2: VIDIOC_S_PARM: %m\n", errno);
+	}
+
 	info("v4l2: %s: found valid V4L2 device (%u x %u) pixfmt=%c%c%c%c\n",
 	       dev_name, fmt.fmt.pix.width, fmt.fmt.pix.height,
 	       pix[0], pix[1], pix[2], pix[3]);
@@ -437,7 +447,6 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	int err;
 
 	(void)ctx;
-	(void)prm;
 	(void)fmt;
 	(void)errorh;
 
@@ -454,6 +463,7 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	st->vs = vs;
 	st->fd = -1;
 	st->sz = *size;
+	st->fps = prm->fps;
 	st->frameh = frameh;
 	st->arg    = arg;
 	st->pixfmt = 0;
