@@ -59,6 +59,7 @@ static struct config core_config = {
 		"", "",
 		"", "",
 		352, 288,
+		0, 0,
 		500000,
 		25,
 	},
@@ -210,6 +211,10 @@ int config_parse_conf(struct config *cfg, const struct conf *conf)
 		cfg->video.width  = size.w;
 		cfg->video.height = size.h;
 	}
+	if (0 == conf_get_vidsz(conf, "video_dst_size", &size)) {
+		cfg->video.dst_width  = size.w;
+		cfg->video.dst_height = size.h;
+	}
 	(void)conf_get_u32(conf, "video_bitrate", &cfg->video.bitrate);
 	(void)conf_get_u32(conf, "video_fps", &cfg->video.fps);
 #else
@@ -287,6 +292,7 @@ int config_print(struct re_printf *pf, const struct config *cfg)
 			 "video_source\t\t%s,%s\n"
 			 "video_display\t\t%s,%s\n"
 			 "video_size\t\t\"%ux%u\"\n"
+			 "video_dst_size\t\t\"%ux%u\"\n"
 			 "video_bitrate\t\t%u\n"
 			 "video_fps\t\t%u\n"
 			 "\n"
@@ -330,6 +336,7 @@ int config_print(struct re_printf *pf, const struct config *cfg)
 			 cfg->video.src_mod, cfg->video.src_dev,
 			 cfg->video.disp_mod, cfg->video.disp_dev,
 			 cfg->video.width, cfg->video.height,
+			 cfg->video.dst_width, cfg->video.dst_height,
 			 cfg->video.bitrate, cfg->video.fps,
 #endif
 

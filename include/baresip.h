@@ -193,6 +193,7 @@ struct config_video {
 	char disp_mod[16];      /**< Video display module           */
 	char disp_dev[128];     /**< Video display device           */
 	unsigned width, height; /**< Video resolution               */
+	unsigned dst_width, dst_height;/**< Video dst resolution    */
 	uint32_t bitrate;       /**< Encoder bitrate in [bit/s]     */
 	uint32_t fps;           /**< Video framerate                */
 };
