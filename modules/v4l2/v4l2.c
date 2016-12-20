@@ -62,6 +62,7 @@ struct vidsrc_st {
 	unsigned int   n_buffers;
 	vidsrc_frame_h *frameh;
 	void *arg;
+    struct vidframe* vid_dst;
 };
 
 
@@ -183,6 +184,7 @@ static int init_mmap(struct vidsrc_st *st, const char *dev_name)
 static int v4l2_init_device(struct vidsrc_st *st, const char *dev_name,
 			    int width, int height)
 {
+	const struct config_video* cfg_video = &conf_config()->video;
 	struct v4l2_capability cap;
 	struct v4l2_format fmt;
 	struct v4l2_fmtdesc fmts;
@@ -282,6 +284,15 @@ static int v4l2_init_device(struct vidsrc_st *st, const char *dev_name,
 		warning("v4l2: VIDIOC_S_PARM: %m\n", errno);
 	}
 
+	// video conv
+	if(cfg_video->dst_width && cfg_video->dst_height &&
+		!(cfg_video->dst_width == fmt.fmt.pix.width && cfg_video->dst_height == fmt.fmt.pix.height)) {
+		struct vidsz size = {cfg_video->dst_width, cfg_video->dst_height};
+		if(vidframe_alloc(&st->vid_dst, VID_FMT_YUV420P, &size)) {
+			return ENOMEM;
+		}
+	}
+
 	info("v4l2: %s: found valid V4L2 device (%u x %u) pixfmt=%c%c%c%c\n",
 	       dev_name, fmt.fmt.pix.width, fmt.fmt.pix.height,
 	       pix[0], pix[1], pix[2], pix[3]);
@@ -313,6 +324,7 @@ static void uninit_device(struct vidsrc_st *st)
 
 	st->buffers = mem_deref(st->buffers);
 	st->n_buffers = 0;
+	st->vid_dst = mem_deref(st->vid_dst);
 }
 
 
@@ -349,7 +361,12 @@ static void call_frame_handler(struct vidsrc_st *st, uint8_t *buf)
 
 	vidframe_init_buf(&frame, match_fmt(st->pixfmt), &st->sz, buf);
 
-	st->frameh(&frame, st->arg);
+	if(st->vid_dst) {
+		vidconv(st->vid_dst, &frame, NULL);
+		st->frameh(st->vid_dst, st->arg);
+	} else {
+		st->frameh(&frame, st->arg);
+	}
 }
 
 
@@ -469,6 +486,7 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	st->frameh = frameh;
 	st->arg    = arg;
 	st->pixfmt = 0;
+	st->vid_dst = NULL;
 
 	err = vd_open(st, dev);
 	if (err)
