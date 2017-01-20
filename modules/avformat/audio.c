@@ -36,11 +36,16 @@ void destructor_common(void *arg) {
 		av_close_input_file(st->ic);
 #endif
 	}
-
+    common = NULL;
 }
 
 static void destructor_audio(void *arg) {
 	struct ausrc_st *st = arg;
+
+    if(st->common->run) {
+        st->common->run = false;
+        pthread_join(st->common->thread, NULL);
+    }
 
 	packet_queue_abort(&st->audioq);
 	if (st->audio_thread_run) {
@@ -50,7 +55,6 @@ static void destructor_audio(void *arg) {
 
 	st->common->as = NULL;
 	st->common = NULL;
-	//common = mem_deref(st->common);
 
 	if(st->avr) {
 		avresample_close(st->avr);
@@ -61,6 +65,7 @@ static void destructor_audio(void *arg) {
 		avcodec_close(st->ctx);
 
 	mem_deref(st->aubuf);
+    mem_deref(common);
 }
 
 static int play_packet(struct ausrc_st *st)
@@ -79,6 +84,27 @@ static int play_packet(struct ausrc_st *st)
 	return 0;
 }
 
+int audio_flush_buffer(struct ausrc_st *st) {
+    if(st == NULL || st->avr == NULL)
+        return -1;
+    
+    const int num_samples = avresample_available(st->avr);
+        
+    int out_linesize;
+    const int osize = av_get_bytes_per_sample(AV_SAMPLE_FMT_S16);
+    int data_size = av_samples_get_buffer_size(&out_linesize, st->prm.ch, num_samples, AV_SAMPLE_FMT_S16, 0);
+    uint8_t* tmp_dest = av_malloc(data_size);
+        
+    const int out_samples = avresample_read(st->avr, &tmp_dest, num_samples);
+    if (out_samples < 0)
+        return -2;
+    
+    data_size = out_samples * osize * st->prm.ch;
+    aubuf_write(st->aubuf, tmp_dest, data_size);
+    av_free(tmp_dest);
+    return 0;
+}
+
 int audio_decode_frame(struct ausrc_st *st, AVPacket* pkt, AVPacket* pkt_temp) {
 	AVFrame *frame = NULL;
 	int got_frame, ret;
@@ -88,10 +114,15 @@ int audio_decode_frame(struct ausrc_st *st, AVPacket* pkt, AVPacket* pkt_temp) {
 
     for (;;) {
 		while (pkt_temp->size > 0 || (!pkt_temp->data && new_packet)) {
-			if (!frame)
-				frame = avcodec_alloc_frame();
-			else
-				avcodec_get_frame_defaults(frame);
+            if (!frame) {
+#if LIBAVUTIL_VERSION_INT >= ((52<<16)+(20<<8)+100)
+				frame = av_frame_alloc();
+#else
+                frame = avcodec_alloc_frame();
+#endif
+            } else {
+				av_frame_unref(frame);
+            }
 
 			if (flush_complete)
 				break;
@@ -223,10 +254,13 @@ int alloc_audio(struct ausrc_st **stp, const struct ausrc *as,
 	if (!st)
 		return ENOMEM;
 
-	if (!common)
-		common = mem_zalloc(sizeof(*common), destructor_common);
-	if (!common)
-		return ENOMEM;
+    if (!common) {
+        common = mem_zalloc(sizeof(*common), destructor_common);
+        if (!common)
+            return ENOMEM;
+    } else {
+        mem_ref(common);
+    }
 
 	st->common = common;
 	st->as   = as;

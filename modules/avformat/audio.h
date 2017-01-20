@@ -43,5 +43,7 @@ void destructor_common(void *arg);
 
 int audio_decode_frame(struct ausrc_st *st, AVPacket* pkt, AVPacket* pkt_temp);
 
+int audio_flush_buffer(struct ausrc_st *st);
+
 void *avformat_read_thread(void *data);
 

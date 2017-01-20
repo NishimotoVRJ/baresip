@@ -106,6 +106,11 @@ extern AVPacket flush_pkt;
 static void destructor(void *arg)
 {
 	struct vidsrc_st *st = arg;
+    
+    if(st->common->run) {
+        st->common->run = false;
+        pthread_join(st->common->thread, NULL);
+    }
 
 #if USE_VIDEO_SEND_THREAD
 	threadq_destroy(&st->video_send);
@@ -122,6 +127,8 @@ static void destructor(void *arg)
 
 	if (st->ctx && st->ctx->codec)
 		avcodec_close(st->ctx);
+    
+    mem_deref(common);
 }
 
 #if USE_VIDEO_SEND_THREAD
@@ -372,6 +379,7 @@ void *avformat_read_thread(void *data)
 
 		if (ret < 0) {
 			debug("avformat: rewind stream (ret=%d)\n", ret);
+            audio_flush_buffer(st->as);            
 			while (st->as && aubuf_cur_size(st->as->aubuf) &&
 					st->vs && st->vs->video_decode.q.nb_packets) {
 				sys_msleep(100);
@@ -389,12 +397,16 @@ void *avformat_read_thread(void *data)
 #endif
 			}
 
-			sys_msleep(1000);
 			av_seek_frame(st->ic, -1, 0, 0);
 			if(st->as){
 				st->as->audio_time = 0;
 				st->as->first_packet_time = 0;
 			}
+
+            //wait for the flush packet to be consumed by video thread
+            while(st->vs && st->vs->video_decode.q.nb_packets){
+                sys_msleep(5);
+            }
 			st->time_start = 0;
 			continue;
 		}
@@ -414,6 +426,7 @@ void *avformat_read_thread(void *data)
             {
             	AVPacket audio_pkt, pkt_temp;
             	memset(&audio_pkt, 0, sizeof(audio_pkt));
+                memset(&pkt_temp, 0, sizeof(pkt_temp));
             	audio_decode_frame(st->as, &audio_pkt, &pkt_temp);
             }
 		}
@@ -447,10 +460,13 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	if (!st)
 		return ENOMEM;
 
-	if (!common)
+    if (!common) {
 		common = mem_zalloc(sizeof(*common), destructor_common);
-	if (!common)
-		return ENOMEM;
+        if (!common)
+            return ENOMEM;
+    } else {
+        mem_ref(common);
+    }
 
 	st->common = common;
 	st->vs     = vs;
@@ -592,6 +608,19 @@ static int alloc(struct vidsrc_st **stp, const struct vidsrc *vs,
 	return err;
 }
 
+static int file_change_handler(struct re_printf *pf, void *arg)
+{
+    const struct cmd_arg *carg = arg;
+    (void)re_hprintf(pf, "file_change_handler %s\n", carg->prm);
+    struct config* cfg = conf_config();
+    strncpy(cfg->video.src_dev, carg->prm, sizeof(cfg->video.src_dev));
+    strncpy(cfg->audio.src_dev, carg->prm, sizeof(cfg->audio.src_dev));
+    return 0;
+}
+
+static const struct cmd cmdv[] = {
+    {"avformat-file", 0, CMD_PRM, "AVFormat file input", file_change_handler},
+};
 
 static int module_init(void)
 {
@@ -613,6 +642,10 @@ static int module_init(void)
 	err = ausrc_register(&ausrc, "avformat", alloc_audio);
 	if (err)
 		goto out;
+    
+    err = cmd_register(baresip_commands(), cmdv, ARRAY_SIZE(cmdv));
+    if (err)
+        goto out;
 
 out:
 	return err;
@@ -628,6 +661,8 @@ static int module_close(void)
 #if LIBAVFORMAT_VERSION_INT >= ((53<<16) + (13<<8) + 0)
 	avformat_network_deinit();
 #endif
+
+    cmd_unregister(baresip_commands(), cmdv);
 
 	return 0;
 }
